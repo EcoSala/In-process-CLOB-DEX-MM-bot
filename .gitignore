@@ -218,3 +218,4 @@ config.yaml
 # OS / editor
 .vscode/
 .idea/
+config.yaml
