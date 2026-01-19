@@ -205,3 +205,16 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# === Project-specific ignores ===
+
+# Virtual environments
+venv/
+.venv/
+
+# Local config & secrets
+config.yaml
+.env
+
+# OS / editor
+.vscode/
+.idea/
