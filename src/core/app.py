@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from .config import Config
 from src.venues.extended_multi import ExtendedMulti
 from src.selection.market_selector import MarketSnapshot, SelectorConfig, select_markets
-from src.sim.paper_mm import PaperMM
+from src.sim.paper_mm import PaperMM, TradeStats
 
 log = logging.getLogger("mm")
 
@@ -20,6 +20,8 @@ class BotApp:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.state = AppState()
+        self.trade_stats = TradeStats()
+        self._stats_log_every = max(1, int(cfg.app.stats_log_every))
 
         # Multi-market public book + trades feeds
         # Expects: cfg.extended_ws, cfg.extended_trades_ws, cfg.extended.markets
@@ -41,6 +43,7 @@ class BotApp:
             quote_half_spread_bps=cfg.sim.quote_half_spread_bps,
             quote_size_usd=cfg.sim.quote_size_usd,
             max_inventory_usd=cfg.sim.max_inventory_usd,
+            trade_stats=self.trade_stats,
         )
 
         # One-time warning flags
@@ -150,6 +153,17 @@ class BotApp:
                 f"cash={self.paper.state.cash_usd:.2f} "
                 f"pnl≈{pnl:.2f}"
             )
+
+            if self.state.ticks % self._stats_log_every == 0:
+                log.info(
+                    f"tick={self.state.ticks} STATS: "
+                    f"trades={self.trade_stats.num_trades} "
+                    f"volume={self.trade_stats.total_volume:.6f} "
+                    f"notional={self.trade_stats.total_notional:.2f} "
+                    f"net_pos={self.paper.state.pos_base:.6f} "
+                    f"buys={self.trade_stats.buy_volume:.6f} "
+                    f"sells={self.trade_stats.sell_volume:.6f}"
+                )
 
             await asyncio.sleep(tick)
 

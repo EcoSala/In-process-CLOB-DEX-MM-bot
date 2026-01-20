@@ -219,3 +219,13 @@ config.yaml
 .vscode/
 .idea/
 config.yaml
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Virtual envs
+.venv/
+venv/
+
+# Real config (never commit secrets)
+config.yaml

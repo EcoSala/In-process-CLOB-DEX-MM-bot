@@ -1,0 +1,34 @@
+app:
+  name: "mm-bot"
+  log_level: "INFO"
+  tick_seconds: 1
+
+risk:
+  max_total_notional: 100000
+  daily_loss_limit: 5000
+  max_inventory_notional: 50000
+
+venues:
+  extended:
+    enabled: true
+  nado:
+    enabled: true
+
+extended_ws:
+  host: "wss://api.starknet.extended.exchange"
+  market: "BTC-USD"
+  depth: 1
+  user_agent: "mm-bot/0.1"
+
+extended:
+  markets: ["BTC-USD", "ETH-USD", "SOL-USD"]
+  selector:
+    min_spread_bps: 0.3
+    min_tpm: 5
+    top_n: 1
+
+sim:
+  enabled: true
+  quote_half_spread_bps: 0.2
+  quote_size_usd: 333
+  max_inventory_usd: 50000

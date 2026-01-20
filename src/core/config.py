@@ -5,6 +5,7 @@ class AppConfig(BaseModel):
     name: str = "mm-bot"
     log_level: str = "INFO"
     tick_seconds: float = 1.0
+    stats_log_every: int = 10
 
 class RiskConfig(BaseModel):
     max_total_notional: float
