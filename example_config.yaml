@@ -2,6 +2,7 @@ app:
   name: "mm-bot"
   log_level: "INFO"
   tick_seconds: 1
+  stats_log_every: 10  # log summary stats every N ticks
 
 risk:
   max_total_notional: 100000
@@ -32,3 +33,6 @@ sim:
   quote_half_spread_bps: 0.2
   quote_size_usd: 333
   max_inventory_usd: 50000
+  execution_tape_history: 1000  # number of fills to keep in memory
+  print_fills: true  # enable/disable per-fill printing to console
+  fill_monitor_window: true  # auto-open separate PowerShell window for fills
