@@ -107,6 +107,10 @@ class ExtendedPublicWS:
         asks = payload.get("a") or []
 
         # depth=1 should give either 0 or 1 level; we handle both.
+        # Roll previous quantities forward before overwriting (used by OFICalculator).
+        self.tob.prev_bid_qty = self.tob.bid_qty
+        self.tob.prev_ask_qty = self.tob.ask_qty
+
         if bids:
             self.tob.bid_px = float(bids[0]["p"])
             self.tob.bid_qty = float(bids[0]["q"])

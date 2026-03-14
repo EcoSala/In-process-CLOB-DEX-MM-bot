@@ -4,6 +4,14 @@ app:
   tick_seconds: 1
   stats_log_every: 10  # log summary stats every N ticks
 
+# ── Audio feedback ────────────────────────────────────────────────────────────
+# Synthesised tones played non-blocking on trading events.
+# Requires:  pip install sounddevice numpy
+# Set enabled: false to silence everything without changing any other config.
+audio:
+  enabled: true
+  volume: 0.6     # master volume [0.0 – 1.0]
+
 risk:
   max_total_notional: 100000
   daily_loss_limit: 5000
@@ -22,17 +30,58 @@ extended_ws:
   user_agent: "mm-bot/0.1"
 
 extended:
-  markets: ["BTC-USD", "ETH-USD", "SOL-USD"]
+  markets_mode: "all"  # "static" = use markets list below, "all" = auto-discover all active markets
+  markets: ["BTC-USD", "ETH-USD", "SOL-USD"]  # Only used if markets_mode == "static"
+  api_base_url: "https://api.starknet.extended.exchange"  # For dynamic market discovery
   selector:
     min_spread_bps: 0.3
     min_tpm: 5
     top_n: 1
+  pinned_market: "SOL-USD" # Optional: set to "SOL-USD" to force trading only that market (ignores selector)
 
 sim:
   enabled: true
   quote_half_spread_bps: 0.2
   quote_size_usd: 333
   max_inventory_usd: 50000
+  tick_size: 0.01              # exchange minimum price increment (SOL-USD = 0.01)
   execution_tape_history: 1000  # number of fills to keep in memory
   print_fills: true  # enable/disable per-fill printing to console
   fill_monitor_window: true  # auto-open separate PowerShell window for fills
+
+  inventory:
+    inv_skew_strength: 2.0      # bps shift per unit norm_inv  (tune: 1–10)
+    size_skew_strength: 0.5     # fractional size change per unit norm_inv  (tune: 0.2–1.0)
+    min_size_mult: 0.1          # minimum size as fraction of base  (floor)
+    max_size_mult: 2.0          # maximum size as fraction of base  (ceiling)
+    near_limit_threshold: 0.8   # |norm_inv| above which near-limit dampening fires
+    near_limit_side_mult: 0.1   # bad-side size factor when near the limit
+
+  # ── Order Flow Imbalance (OFI) signal ─────────────────────────────────────
+  # Biases the reservation price toward net buying/selling flow.
+  # Positive OFI (buying pressure)  → shift quotes UP   (protect against selling cheap)
+  # Negative OFI (selling pressure) → shift quotes DOWN (protect against buying dear)
+  ofi:
+    enabled: true
+    mode: "trade"          # "trade": uses TradeTape (recommended, zero extra state)
+                           # "quote": uses TOB qty deltas (richer but lower resolution at 1Hz)
+    window_seconds: 10.0   # look-back window for OFI calculation
+    ofi_skew_strength: 1.0 # bps shift on reservation_price per unit OFI signal  (tune: 0–5)
+                           # Combined with inv_skew_strength; calibrate together to avoid over-skewing
+
+  # ── Hard inventory hedge ────────────────────────────────────────────────────
+  # Fires an aggressive (market-order) fill when |norm_inv| exceeds trigger_threshold.
+  # Hedge fills are logged with side="HEDGE_BUY" / "HEDGE_SELL" and excluded from
+  # total_edge_collected (they are a cost, not edge).
+  hedge:
+    enabled: true
+    trigger_threshold: 0.9   # |norm_inv| above which inventory-limit hedge fires  (must be > near_limit_threshold)
+    hedge_fraction: 0.5       # fraction of position to flatten per inventory-limit hedge  (tune: 0.25–1.0)
+    cooldown_ticks: 5         # minimum ticks between successive hedges on the same market
+    # Profit-take trigger: if price moves this % favorably from avg entry (UP when long,
+    # DOWN when short), flatten 100 % of position immediately, bypassing cooldown.
+    # Set to 0 to disable.
+    price_move_trigger_pct: 1.0
+    # Taker fee charged on every aggressive hedge order (in %).
+    # 0.0225 % = Extended exchange standard taker rate.
+    taker_fee_pct: 0.0225

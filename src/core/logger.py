@@ -32,7 +32,7 @@ def setup_fill_logger(enabled: bool = True, log_file: str = "fills.log") -> logg
     """
     Setup a dedicated logger for execution fills.
     
-    Writes fills to a file (without colors) for easy redirection and monitoring.
+    Writes fills to a file WITH colors so PowerShell window can render them.
     Returns a logger that can be disabled via the enabled flag.
     """
     fill_logger = logging.getLogger("mm.fill")
@@ -43,9 +43,9 @@ def setup_fill_logger(enabled: bool = True, log_file: str = "fills.log") -> logg
     fill_logger.handlers.clear()
     
     if enabled:
-        # File handler: writes to file WITHOUT colors (strips ANSI codes)
-        file_handler = logging.FileHandler(log_file, mode='w')  # Overwrite on restart
-        file_formatter = StripAnsiFormatter("%(message)s")
+        # File handler: writes to file WITH colors (PowerShell renders ANSI codes)
+        file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')  # Overwrite on restart
+        file_formatter = logging.Formatter("%(message)s")  # Keep ANSI codes for PowerShell
         file_handler.setFormatter(file_formatter)
         fill_logger.addHandler(file_handler)
     
@@ -85,3 +85,42 @@ def spawn_fill_monitor_window(log_file: str = "fills.log") -> None:
         logging.getLogger("mm").info(f"Opened fill monitor window for: {abs_log_path}")
     except Exception as e:
         logging.getLogger("mm").warning(f"Failed to open fill monitor window: {e}")
+
+
+def spawn_order_ladder_window(log_file: str = "orders_ladder.log") -> None:
+    """
+    Spawn a separate PowerShell window to display the active orders ladder.
+    
+    This window refreshes every 250ms to show a non-scrolling snapshot of active orders.
+    """
+    if sys.platform != "win32":
+        logging.getLogger("mm").warning(
+            "Order ladder window only supported on Windows. Skipping."
+        )
+        return
+    
+    # Ensure the log file exists (empty initially)
+    Path(log_file).touch(exist_ok=True)
+    
+    # Get absolute path for the log file
+    abs_log_path = Path(log_file).resolve()
+    
+    # PowerShell command to continuously display the file contents (like 'watch' or 'top')
+    # Clear screen and read file in a loop for non-scrolling display
+    ps_command = f"""
+while ($true) {{
+    Clear-Host
+    Get-Content '{abs_log_path}'
+    Start-Sleep -Milliseconds 250
+}}
+"""
+    
+    # Start a new PowerShell window (non-blocking)
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoExit", "-Command", ps_command],
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+        )
+        logging.getLogger("mm").info(f"Opened order ladder window for: {abs_log_path}")
+    except Exception as e:
+        logging.getLogger("mm").warning(f"Failed to open order ladder window: {e}")

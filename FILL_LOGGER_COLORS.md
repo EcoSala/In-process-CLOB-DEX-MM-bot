@@ -12,8 +12,8 @@ Enhanced the execution tape logger with alternating row colors and BUY/SELL high
 - Trade counter persists within the `ExecutionTape` instance
 
 ### 2. Alternating Row Colors
-- **Odd trades** (#00001, #00003, #00005, ...): **BLUE** rows
-- **Even trades** (#00002, #00004, #00006, ...): **YELLOW** rows
+- **Odd trades** (#00001, #00003, #00005, ...): **WHITE** (default) rows
+- **Even trades** (#00002, #00004, #00006, ...): **BRIGHT BLUE** rows
 - Row color is determined by `trade_id % 2`
 
 ### 3. BUY/SELL Color Highlighting
@@ -23,16 +23,16 @@ Enhanced the execution tape logger with alternating row colors and BUY/SELL high
 
 ### 4. ANSI Color Codes
 Uses Windows PowerShell-compatible ANSI codes:
-- `\033[94m` - Bright blue (odd trades)
-- `\033[93m` - Bright yellow (even trades)
+- `\033[0m` - Default white (odd trades)
+- `\033[94m` - Bright blue (even trades)
 - `\033[92m` - Bright green (BUY)
 - `\033[91m` - Bright red (SELL)
 - `\033[0m` - Reset (prevents color bleeding)
 
 ### 5. File vs Console Output
-- **fills.log**: Plain text without ANSI codes (easy to parse/analyze)
-- **Console/PowerShell window**: N/A (tails the plain file)
-- Uses `StripAnsiFormatter` to automatically remove ANSI codes when writing to file
+- **fills.log**: Contains ANSI color codes for PowerShell rendering
+- **Console/PowerShell window**: Renders colors by tailing `fills.log` with `Get-Content -Wait`
+- PowerShell natively supports ANSI escape sequences and displays colors automatically
 
 ## Implementation Details
 
@@ -49,9 +49,9 @@ Uses Windows PowerShell-compatible ANSI codes:
   - Proper color reset to prevent bleeding
 
 #### 2. `src/core/logger.py`
-- Created `StripAnsiFormatter` class to strip ANSI codes for file output
-- Updated `setup_fill_logger()` to use the custom formatter
-- File handler automatically strips colors using regex pattern
+- Created `StripAnsiFormatter` class (available for future use if plain text needed)
+- Updated `setup_fill_logger()` to write ANSI codes to file with UTF-8 encoding
+- PowerShell window renders colors by reading the file with `Get-Content -Wait`
 
 ### Example Output Format
 
@@ -62,9 +62,9 @@ Uses Windows PowerShell-compatible ANSI codes:
 ```
 
 **Visual representation:**
-- Line #00001: 🟦 BLUE row with 🟩 GREEN "BUY"
-- Line #00002: 🟨 YELLOW row with 🟩 GREEN "BUY"
-- Line #00003: 🟦 BLUE row with 🟥 RED "SELL"
+- Line #00001: ⚪ WHITE row with 🟩 GREEN "BUY"
+- Line #00002: 🔵 BRIGHT BLUE row with 🟩 GREEN "BUY"
+- Line #00003: ⚪ WHITE row with 🟥 RED "SELL"
 
 ## Testing
 
@@ -81,8 +81,14 @@ Created test files to verify implementation:
 
 ### Color Configuration
 Colors are hardcoded in `_print_fill()` method. To change colors:
-1. Modify the ANSI escape codes in `src/sim/paper_mm.py` lines 117-120
+1. Modify the ANSI escape codes in `src/sim/paper_mm.py` lines 113-120
 2. ANSI color code reference: https://en.wikipedia.org/wiki/ANSI_escape_code#Colors
+
+Current color scheme:
+- Odd trades: Default white (`\033[0m`)
+- Even trades: Bright blue (`\033[94m`)
+- BUY: Bright green (`\033[92m`)
+- SELL: Bright red (`\033[91m`)
 
 ### Performance
 - Minimal performance impact: only string formatting overhead
@@ -92,11 +98,11 @@ Colors are hardcoded in `_print_fill()` method. To change colors:
 ## Constraints Met
 
 ✅ Alternating row colors based on trade_id  
-✅ BUY/SELL independent coloring  
+✅ BUY/SELL independent coloring (GREEN/RED)  
 ✅ Trade numbering with monotonic IDs  
 ✅ Windows PowerShell-compatible ANSI codes  
 ✅ Proper color reset (no bleeding)  
-✅ Colors stripped from file output  
+✅ Colors written to file for PowerShell rendering  
 ✅ No changes to trading logic or PnL math  
 ✅ Maintains current field order and content  
 
