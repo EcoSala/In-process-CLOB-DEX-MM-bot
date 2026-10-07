@@ -3,13 +3,11 @@ app:
   log_level: "INFO"
   tick_seconds: 1
   stats_log_every: 10  # log summary stats every N ticks
+  log_file: "logs/mm.log"  # rotating file; stdout still goes to journald/systemd
 
-# ── Audio feedback ────────────────────────────────────────────────────────────
-# Synthesised tones played non-blocking on trading events.
-# Requires:  pip install sounddevice numpy
-# Set enabled: false to silence everything without changing any other config.
+# ── Audio feedback (UI / main.py only; run.py is silent) ─────────────────────
 audio:
-  enabled: true
+  enabled: false
   volume: 0.6     # master volume [0.0 – 1.0]
 
 risk:
@@ -30,14 +28,23 @@ extended_ws:
   user_agent: "mm-bot/0.1"
 
 extended:
-  markets_mode: "all"  # "static" = use markets list below, "all" = auto-discover all active markets
-  markets: ["BTC-USD", "ETH-USD", "SOL-USD"]  # Only used if markets_mode == "static"
+  markets_mode: "static"  # "static" = use markets list below, "all" = auto-discover all active markets
+  markets: ["BTC-USD", "ETH-USD", "SOL-USD", "ARB-USD", "FIL-USD"]
   api_base_url: "https://api.starknet.extended.exchange"  # For dynamic market discovery
   selector:
-    min_spread_bps: 0.3
-    min_tpm: 5
-    top_n: 1
-  pinned_market: "SOL-USD" # Optional: set to "SOL-USD" to force trading only that market (ignores selector)
+    min_spread_bps: 0.0   # 0 so tight books (BTC) are not dropped
+    min_tpm: 0
+    top_n: 5
+  pinned_market: null     # quote/subscribe all extended.markets (not a single pin)
+
+# Raw L2 (depth=10) + public trades + paper quotes/fills. No real orders.
+# On Azure, set dir to an absolute data-disk path, e.g. /data/mm_bot/recordings
+recording:
+  enabled: true
+  dir: "data/recordings"
+  book_depth: 10
+  markets: ["BTC-USD", "ETH-USD", "SOL-USD", "ARB-USD", "FIL-USD"]
+  metrics_every_ticks: 60  # PnL snapshot once per minute at 1s ticks
 
 sim:
   enabled: true
@@ -47,7 +54,7 @@ sim:
   tick_size: 0.01              # exchange minimum price increment (SOL-USD = 0.01)
   execution_tape_history: 1000  # number of fills to keep in memory
   print_fills: true  # enable/disable per-fill printing to console
-  fill_monitor_window: true  # auto-open separate PowerShell window for fills
+  fill_monitor_window: false  # Windows PowerShell tail only; keep false on Linux/Azure
 
   inventory:
     inv_skew_strength: 2.0      # bps shift per unit norm_inv  (tune: 1–10)

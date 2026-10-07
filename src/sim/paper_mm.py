@@ -410,12 +410,19 @@ class InventoryControlParams:
     Mirrors InventoryConfig in config.py; kept as a plain dataclass so
     paper_mm.py has no pydantic dependency.
     """
-    inv_skew_strength:    float = 2.0   # bps price shift per unit norm_inv
+    inv_skew_strength:    float = 10.0  # bps price shift per unit norm_inv
     size_skew_strength:   float = 0.5   # fractional size change per unit norm_inv
     min_size_mult:        float = 0.1   # floor on size multiplier
     max_size_mult:        float = 2.0   # ceiling on size multiplier
     near_limit_threshold: float = 0.8   # |norm_inv| above which dampening fires
     near_limit_side_mult: float = 0.1   # bad-side size factor near the limit
+    # Volatility-scaled spread: half_spread = max(base, k * ewma_1m_range_bps)
+    vol_spread_k:         float = 0.5
+    vol_ewma_span:        int   = 30    # 1m candles (or live ticks) in the EWMA
+    max_half_spread_bps:  float = 40.0  # cap so crash bars don't quote 200 bps
+    # One-sided quoting when inventory or OFI is toxic
+    toxic_inv_threshold:  float = 0.4   # |norm_inv| → quote only the flattening side
+    toxic_ofi_threshold:  float = 0.3   # |ofi| → pull the informed/toxic side
 
 
 @dataclass
@@ -436,7 +443,6 @@ class HedgeParams:
     trigger_threshold:      float = 0.9     # |norm_inv| above which inventory-limit hedge fires
     hedge_fraction:         float = 0.5     # fraction of position to flatten per inventory-limit hedge
     cooldown_ticks:         int   = 5       # minimum ticks between hedges on same market
-    price_move_trigger_pct: float = 1.0     # % favorable price move that triggers full flatten
     taker_fee_pct:          float = 0.0225  # taker fee in % charged on every hedge notional
 
 
@@ -447,6 +453,7 @@ class PaperMM:
         quote_size_usd: float,
         max_inventory_usd: float,
         tick_size: float = 0.01,
+        maker_fee_pct: float = 0.0,
         inventory_cfg: Optional[InventoryControlParams] = None,
         ofi_cfg: Optional[OFIParams] = None,
         hedge_cfg: Optional[HedgeParams] = None,
@@ -458,6 +465,7 @@ class PaperMM:
         self.quote_size_usd = float(quote_size_usd)
         self.max_inventory_usd = float(max_inventory_usd)
         self.tick_size = float(tick_size)
+        self.maker_fee_rate = float(maker_fee_pct) / 100.0  # e.g. 0.02% → 0.0002
         self.state = PaperState()
         self.trade_stats = trade_stats
         self.execution_tape = execution_tape
@@ -471,6 +479,15 @@ class PaperMM:
         self.max_size_mult        = _inv.max_size_mult
         self.near_limit_threshold = _inv.near_limit_threshold
         self.near_limit_side_mult = _inv.near_limit_side_mult
+        self.vol_spread_k         = _inv.vol_spread_k
+        self.vol_ewma_span        = max(2, int(_inv.vol_ewma_span))
+        self.max_half_spread_bps  = _inv.max_half_spread_bps
+        self.toxic_inv_threshold  = _inv.toxic_inv_threshold
+        self.toxic_ofi_threshold  = _inv.toxic_ofi_threshold
+        self._vol_alpha           = 2.0 / (self.vol_ewma_span + 1.0)
+        self._vol_ewma_bps        = 0.0
+        self._vol_ready           = False
+        self.last_half_spread_bps = float(quote_half_spread_bps)
 
         # OFI signal parameters
         _ofi = ofi_cfg if ofi_cfg is not None else OFIParams()
@@ -481,7 +498,6 @@ class PaperMM:
         self.hedge_trigger_threshold:      float = _hedge.trigger_threshold
         self.hedge_fraction:               float = _hedge.hedge_fraction
         self.hedge_cooldown_ticks:         int   = _hedge.cooldown_ticks
-        self.price_move_trigger_pct:       float = _hedge.price_move_trigger_pct
         self.taker_fee_rate:               float = _hedge.taker_fee_pct / 100.0
 
         # Per-market hedge cooldown tracking: market → last tick when hedge fired
@@ -535,8 +551,16 @@ class PaperMM:
             reservation_price = reservation_price * (1.0 + ofi_bps / 10_000.0)
         self.last_ofi_signal = ofi_signal
 
-        # ── Step 3: Raw bid / ask around the reservation price ───────────────────
-        half    = self.half_spread_bps / 10_000.0
+        # ── Step 3: Volatility-scaled half-spread ──────────────────────────────
+        # Base floor is quote_half_spread_bps (typically max(8, market spread/2)).
+        # Widen with lagged EWMA of 1m range so volatile alts are not quoted tight.
+        half_bps = self.half_spread_bps
+        if self.vol_spread_k > 0.0 and self._vol_ready:
+            half_bps = max(half_bps, self.vol_spread_k * self._vol_ewma_bps)
+        if self.max_half_spread_bps > 0.0:
+            half_bps = min(half_bps, self.max_half_spread_bps)
+        self.last_half_spread_bps = half_bps
+        half    = half_bps / 10_000.0
         raw_bid = reservation_price * (1.0 - half)
         raw_ask = reservation_price * (1.0 + half)
 
@@ -564,6 +588,28 @@ class PaperMM:
             # Near short limit – strongly discourage additional sells
             ask_qty *= self.near_limit_side_mult
 
+        # ── Step 6b: Pull the toxic side (one-sided quoting) ─────────────────────
+        # Inventory flatten always wins: if we are long we MUST keep the ask.
+        # OFI then pulls the informed side when we are not inventory-constrained.
+        quote_bid = True
+        quote_ask = True
+        if self.toxic_ofi_threshold > 0.0:
+            if ofi_signal >= self.toxic_ofi_threshold:
+                quote_ask = False   # buying pressure → don't sell into the lift
+            if ofi_signal <= -self.toxic_ofi_threshold:
+                quote_bid = False   # selling pressure → don't buy the dump
+        if self.toxic_inv_threshold > 0.0:
+            if norm_inv >= self.toxic_inv_threshold:
+                quote_bid = False
+                quote_ask = True    # long → only flatten (sell)
+            elif norm_inv <= -self.toxic_inv_threshold:
+                quote_ask = False
+                quote_bid = True    # short → only flatten (buy)
+        if not quote_bid:
+            bid_qty = 0.0
+        if not quote_ask:
+            ask_qty = 0.0
+
         # ── Step 7: Tick snapping ────────────────────────────────────────────────
         # Applied AFTER all price math so that small skews are not silently lost.
         bid = snap_bid(raw_bid, self.tick_size)
@@ -590,14 +636,34 @@ class PaperMM:
         # ── Update order ladder ──────────────────────────────────────────────────
         if self.order_ladder:
             self.order_ladder.cancel_all_orders(self.current_market)
-            self.active_bid_order = self.order_ladder.add_order(
-                market=self.current_market, side="BID", price=bid, qty=bid_qty
-            )
-            self.active_ask_order = self.order_ladder.add_order(
-                market=self.current_market, side="ASK", price=ask, qty=ask_qty
-            )
+            self.active_bid_order = None
+            self.active_ask_order = None
+            if bid_qty > 1e-12:
+                self.active_bid_order = self.order_ladder.add_order(
+                    market=self.current_market, side="BID", price=bid, qty=bid_qty
+                )
+            if ask_qty > 1e-12:
+                self.active_ask_order = self.order_ladder.add_order(
+                    market=self.current_market, side="ASK", price=ask, qty=ask_qty
+                )
 
         return Quote(bid_px=bid, ask_px=ask, bid_qty=bid_qty, ask_qty=ask_qty)
+
+    def update_realized_vol(self, range_bps: float) -> None:
+        """
+        Feed the *completed* bar's range (in bps) into the EWMA.
+
+        Must be called AFTER quoting/fills for the current bar so the next
+        quote uses only lagged volatility (no look-ahead).
+        """
+        if range_bps < 0.0:
+            return
+        if not self._vol_ready:
+            self._vol_ewma_bps = float(range_bps)
+            self._vol_ready = True
+            return
+        a = self._vol_alpha
+        self._vol_ewma_bps = a * float(range_bps) + (1.0 - a) * self._vol_ewma_bps
 
     def _inv_usd(self, market: str, mid: float) -> float:
         """Get inventory in USD for a specific market"""
@@ -697,12 +763,22 @@ class PaperMM:
         old_avg_price = pos_state["avg_price"]
         
         inv_usd = self._inv_usd(self.current_market, mid)
+        if mid <= 0:
+            return
 
-        if side == "BUY":
+        side_u = str(side).upper()
+        aggressor_buy = side_u.startswith("B")
+        aggressor_sell = side_u.startswith("S")
+
+        if aggressor_buy:
             # we sell to buyer at our ask
-            if q.ask_px <= trade_px and inv_usd > -self.max_inventory_usd:
-                fill_qty = min(q.ask_qty, trade_qty)
+            room_qty = max(0.0, (inv_usd + self.max_inventory_usd) / mid)
+            if q.ask_px <= trade_px:
+                fill_qty = min(q.ask_qty, trade_qty, room_qty)
+                if fill_qty < 1e-12:
+                    return
                 fill_px = q.ask_px
+                q.ask_qty = max(0.0, q.ask_qty - fill_qty)
                 
                 # Calculate realized PnL (we're selling, so negative qty)
                 realized_pnl_trade, new_avg_price = self._calculate_realized_pnl(
@@ -714,15 +790,16 @@ class PaperMM:
                 pos_state["avg_price"] = new_avg_price
                 pos_state["realized_pnl"] += realized_pnl_trade
                 
-                # Update global cash
-                self.state.cash_usd += fill_qty * fill_px
+                # Update global cash (deduct maker fee on passive sell)
+                maker_fee = fill_qty * fill_px * self.maker_fee_rate
+                self.state.cash_usd += fill_qty * fill_px - maker_fee
                 
                 # Update order ladder (ask filled)
                 if self.order_ladder and self.active_ask_order:
                     self.order_ladder.update_fill(self.active_ask_order, fill_qty)
                 
-                # Accumulate edge (bot's side is SELL, fill price is ask > mid)
-                fill_edge = calculate_trade_edge(fill_px, mid, "SELL", fill_qty)
+                # Accumulate edge net of maker fee (bot's side is SELL, fill price is ask > mid)
+                fill_edge = calculate_trade_edge(fill_px, mid, "SELL", fill_qty) - maker_fee
                 self.total_edge_collected += fill_edge
 
                 # Record stats
@@ -730,9 +807,9 @@ class PaperMM:
                     self.trade_stats.record(fill_qty, fill_px, side)
                 
                 # Record to execution tape
+                # Note: pnl_after = global_cash + this_market_MTM; for multi-market
+                # setups this is approximate (global cash includes PnL from other markets).
                 if self.execution_tape:
-                    # Use per-market MTM only (not mark_to_mid which contaminates
-                    # all positions with a single market's mid price)
                     pnl = self.state.cash_usd + pos_state["pos"] * mid
                     self.execution_tape.record_fill(
                         tick=self.current_tick,
@@ -752,11 +829,15 @@ class PaperMM:
                         trigger_tape_price=trade_px,
                     )
 
-        elif side == "SELL":
+        elif aggressor_sell:
             # we buy from seller at our bid
-            if q.bid_px >= trade_px and inv_usd < self.max_inventory_usd:
-                fill_qty = min(q.bid_qty, trade_qty)
+            room_qty = max(0.0, (self.max_inventory_usd - inv_usd) / mid)
+            if q.bid_px >= trade_px:
+                fill_qty = min(q.bid_qty, trade_qty, room_qty)
+                if fill_qty < 1e-12:
+                    return
                 fill_px = q.bid_px
+                q.bid_qty = max(0.0, q.bid_qty - fill_qty)
                 
                 # Calculate realized PnL (we're buying, so positive qty)
                 realized_pnl_trade, new_avg_price = self._calculate_realized_pnl(
@@ -768,15 +849,16 @@ class PaperMM:
                 pos_state["avg_price"] = new_avg_price
                 pos_state["realized_pnl"] += realized_pnl_trade
                 
-                # Update global cash
-                self.state.cash_usd -= fill_qty * fill_px
+                # Update global cash (add maker fee cost on passive buy)
+                maker_fee = fill_qty * fill_px * self.maker_fee_rate
+                self.state.cash_usd -= fill_qty * fill_px + maker_fee
                 
                 # Update order ladder (bid filled)
                 if self.order_ladder and self.active_bid_order:
                     self.order_ladder.update_fill(self.active_bid_order, fill_qty)
                 
-                # Accumulate edge (bot's side is BUY, fill price is bid < mid)
-                fill_edge = calculate_trade_edge(fill_px, mid, "BUY", fill_qty)
+                # Accumulate edge net of maker fee (bot's side is BUY, fill price is bid < mid)
+                fill_edge = calculate_trade_edge(fill_px, mid, "BUY", fill_qty) - maker_fee
                 self.total_edge_collected += fill_edge
 
                 # Record stats
@@ -784,8 +866,8 @@ class PaperMM:
                     self.trade_stats.record(fill_qty, fill_px, side)
                 
                 # Record to execution tape
+                # Note: pnl_after is approximate for multi-market (see SELL branch comment).
                 if self.execution_tape:
-                    # Per-market MTM only (see SELL branch comment)
                     pnl = self.state.cash_usd + pos_state["pos"] * mid
                     self.execution_tape.record_fill(
                         tick=self.current_tick,
@@ -807,19 +889,11 @@ class PaperMM:
 
     def execute_hedge(self, market: str, tob: "TopOfBook", mid: float) -> bool:
         """
-        Simulate an aggressive (market-order) hedge fill.  Two independent scenarios
-        can each trigger a hedge; both deduct a taker fee from cash.
+        Simulate an aggressive (market-order) inventory-limit hedge fill.
 
-        Scenario A — Inventory-limit hedge (existing):
-          Fires when |norm_inv| ≥ hedge_trigger_threshold AND cooldown has elapsed.
-          Flattens hedge_fraction of current position.
-
-        Scenario B — Favorable price-move profit-take (new):
-          Fires when price has moved ≥ price_move_trigger_pct % in the FAVORABLE
-          direction from the average entry price:
-            • long  → price rose ≥ threshold % above avg_price  (take profit)
-            • short → price fell ≥ threshold % below avg_price  (take profit)
-          Bypasses cooldown and norm_inv threshold.  Always flattens 100% of position.
+        Fires when |norm_inv| ≥ hedge_trigger_threshold AND the cooldown has elapsed.
+        Flattens hedge_fraction of the current position at the best available price
+        (hit the bid when long, lift the ask when short).
 
         Taker fee:
           fee = notional × taker_fee_rate  deducted from cash_usd on every hedge fill.
@@ -835,28 +909,10 @@ class PaperMM:
         inv_usd  = self._inv_usd(market, mid)
         norm_inv = max(-1.0, min(1.0, inv_usd / self.max_inventory_usd)) if self.max_inventory_usd else 0.0
 
-        # ── Scenario B: favorable price-move profit-take ──────────────────────
-        # Checked first so it can fire even when cooldown is active.
-        price_triggered = False
-        if self.price_move_trigger_pct > 0:
-            avg_px = pos_state["avg_price"]
-            if avg_px > 0:
-                if current_pos > 0:
-                    pct_move = (mid - avg_px) / avg_px * 100.0
-                    price_triggered = pct_move >= self.price_move_trigger_pct
-                else:
-                    pct_move = (avg_px - mid) / avg_px * 100.0
-                    price_triggered = pct_move >= self.price_move_trigger_pct
-
-        # ── Scenario A: inventory-limit hedge with cooldown ───────────────────
-        threshold_triggered = False
-        if not price_triggered:
-            last_tick = self._last_hedge_tick.get(market, -(self.hedge_cooldown_ticks + 1))
-            cooldown_ok = self.current_tick - last_tick >= self.hedge_cooldown_ticks
-            if abs(norm_inv) >= self.hedge_trigger_threshold and cooldown_ok:
-                threshold_triggered = True
-
-        if not price_triggered and not threshold_triggered:
+        # ── Inventory-limit hedge with cooldown ───────────────────────────────
+        last_tick = self._last_hedge_tick.get(market, -(self.hedge_cooldown_ticks + 1))
+        cooldown_ok = self.current_tick - last_tick >= self.hedge_cooldown_ticks
+        if not (abs(norm_inv) >= self.hedge_trigger_threshold and cooldown_ok):
             return False
 
         # ── Determine direction and fill price ────────────────────────────────
@@ -865,8 +921,7 @@ class PaperMM:
             fill_px = getattr(tob, "bid_px", None)
             if fill_px is None or fill_px <= 0:
                 return False
-            # Scenario B always fully flattens; scenario A uses hedge_fraction
-            fill_qty   = abs(current_pos) if price_triggered else abs(current_pos) * self.hedge_fraction
+            fill_qty   = abs(current_pos) * self.hedge_fraction
             qty_signed = -fill_qty
             side_str   = "HEDGE_SELL"
         else:
@@ -874,7 +929,7 @@ class PaperMM:
             fill_px = getattr(tob, "ask_px", None)
             if fill_px is None or fill_px <= 0:
                 return False
-            fill_qty   = abs(current_pos) if price_triggered else abs(current_pos) * self.hedge_fraction
+            fill_qty   = abs(current_pos) * self.hedge_fraction
             qty_signed = fill_qty
             side_str   = "HEDGE_BUY"
 
@@ -907,7 +962,7 @@ class PaperMM:
         self.hedge_count += 1
 
         # ── Log to execution tape ─────────────────────────────────────────────
-        # Edge is intentionally 0.0 — hedge fills are taker trades (cost, not edge).
+        # Edge is intentionally -fee — hedge fills are taker trades (cost, not edge).
         # total_edge_collected is NOT incremented.
         if self.execution_tape:
             pnl = self.state.cash_usd + pos_state["pos"] * mid
@@ -929,9 +984,8 @@ class PaperMM:
                 is_hedge=True,
             )
 
-        trigger_reason = "PRICE_MOVE" if price_triggered else "INV_LIMIT"
         log.info(
-            f"HEDGE[{trigger_reason}]: {side_str} {fill_qty:.4f} @ {fill_px:.2f} "
+            f"HEDGE[INV_LIMIT]: {side_str} {fill_qty:.4f} @ {fill_px:.2f} "
             f"fee=${fee:.4f} "
             f"(norm_inv={norm_inv:+.3f} → "
             f"{max(-1.0, min(1.0, pos_state['pos'] * mid / self.max_inventory_usd)):+.3f})"

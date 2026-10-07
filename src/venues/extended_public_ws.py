@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from typing import Optional
+from typing import Optional, Any
 
 import aiohttp
 
@@ -12,14 +12,14 @@ log = logging.getLogger("mm")
 
 class ExtendedPublicWS:
     """
-    Public WS for best bid/ask (depth=1) order book stream.
-    Docs:
-    - Host: wss://api.starknet.extended.exchange
-    - Path: /stream.extended.exchange/v1/orderbooks/{market}?depth=1
-    - Messages include SNAPSHOT/DELTA; depth=1 is always snapshot best bid/ask.
+    Public WS for order book SNAPSHOT/DELTA stream.
+
+    Depth comes from config (paper MM only uses TopOfBook BBO = level 0).
+    Raw TEXT frames are forwarded to an optional MarketRecorder before parse.
     """
-    def __init__(self, cfg: ExtendedWSConfig):
+    def __init__(self, cfg: ExtendedWSConfig, recorder: Any = None):
         self.cfg = cfg
+        self.recorder = recorder
         self.tob = TopOfBook()
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
@@ -78,6 +78,8 @@ class ExtendedPublicWS:
                         break
 
                     if msg.type == aiohttp.WSMsgType.TEXT:
+                        if self.recorder is not None:
+                            self.recorder.capture("book", self.cfg.market, msg.data)
                         self._handle_message(msg.data)
                     elif msg.type == aiohttp.WSMsgType.ERROR:
                         raise ws.exception() or RuntimeError("WS error")

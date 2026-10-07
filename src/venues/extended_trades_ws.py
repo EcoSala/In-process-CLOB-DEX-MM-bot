@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from typing import Optional
+from typing import Optional, Any
 
 import aiohttp
 
@@ -11,8 +11,9 @@ from src.data.trade_tape import TradeTape
 log = logging.getLogger("mm")
 
 class ExtendedTradesWS:
-    def __init__(self, cfg: ExtendedWSConfig):
+    def __init__(self, cfg: ExtendedWSConfig, recorder: Any = None):
         self.cfg = cfg
+        self.recorder = recorder
         self.tape = TradeTape()
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
@@ -68,6 +69,8 @@ class ExtendedTradesWS:
                         break
 
                     if msg.type == aiohttp.WSMsgType.TEXT:
+                        if self.recorder is not None:
+                            self.recorder.capture("trades", self.cfg.market, msg.data)
                         self._handle_message(msg.data)
                     elif msg.type == aiohttp.WSMsgType.ERROR:
                         raise ws.exception() or RuntimeError("WS error")

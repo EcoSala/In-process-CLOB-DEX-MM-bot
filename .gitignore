@@ -229,3 +229,28 @@ venv/
 
 # Real config (never commit secrets)
 config.yaml
+
+# Live market-data recordings
+data/recordings/
+
+# Rotating process / fill logs
+logs/
+fills.log
+fills.log.*
+orders_ladder.log
+
+# Local backtest dumps and plots (too large / generated)
+backtest_*.csv
+*.png
+plots/
+
+# Scratch scripts
+scripts/_tmp_*
+scripts/__pycache__/
+
+# WIP research notes (not part of the public snapshot)
+PROBABILISTIC_*.md
+FILL_LOGGER_*.md
+FILL_MODEL_REFERENCE.md
+ORDER_LADDER_FEATURE.md
+DYNAMIC_MARKETS.md

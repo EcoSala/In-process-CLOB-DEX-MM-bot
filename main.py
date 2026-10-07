@@ -44,7 +44,7 @@ def _run_engine(bot: BotApp) -> None:
 
 def main() -> None:
     cfg = load_config("config.yaml")
-    setup_logging(cfg.app.log_level)
+    setup_logging(cfg.app.log_level, log_file=cfg.app.log_file)
 
     store = BotStateStore()
 

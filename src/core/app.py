@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from .config import Config
@@ -17,6 +18,7 @@ except ImportError:
     TapeTradeEvent = None   # type: ignore[assignment,misc]
 from src.venues.extended_multi import ExtendedMulti
 from src.venues.extended_rest import ExtendedRESTClient
+from src.venues.recorder import MarketRecorder
 from src.selection.market_selector import MarketSnapshot, SelectorConfig, select_markets
 from src.sim.paper_mm import (
     PaperMM, TradeStats, ExecutionTape, OrderLadder,
@@ -41,10 +43,11 @@ class BotApp:
         self.trade_stats = TradeStats()
         self._stats_log_every = max(1, int(cfg.app.stats_log_every))
         
-        # Setup dedicated fill logger (writes to fills.log)
+        # Setup dedicated fill logger (append + rotate; never truncate on restart)
         print_fills = getattr(cfg.sim, 'print_fills', True)
-        self.fill_log_file = "fills.log"
+        self.fill_log_file = "logs/fills.log"
         fill_logger = setup_fill_logger(enabled=print_fills, log_file=self.fill_log_file)
+        self._shutdown: Optional[asyncio.Event] = None
         
         # Execution tape for live fill logging
         tape_history = getattr(cfg.sim, 'execution_tape_history', 200)
@@ -56,14 +59,6 @@ class BotApp:
         
         # Track if we should spawn monitor windows
         self._spawn_fill_window = print_fills and getattr(cfg.sim, 'fill_monitor_window', True)
-
-        # Multi-market public book + trades feeds
-        # Expects: cfg.extended_ws, cfg.extended_trades_ws, cfg.extended.markets
-        self.ext_multi = ExtendedMulti(
-            cfg.extended_ws,
-            cfg.extended_ws,  # <-- FIX: was cfg.extended_ws twice
-            cfg.extended.markets,
-        )
 
         # Market selection thresholds
         self.selector_cfg = SelectorConfig(
@@ -92,6 +87,7 @@ class BotApp:
             quote_size_usd=cfg.sim.quote_size_usd,
             max_inventory_usd=cfg.sim.max_inventory_usd,
             tick_size=cfg.sim.tick_size,
+            maker_fee_pct=cfg.sim.maker_fee_pct,
             inventory_cfg=InventoryControlParams(
                 inv_skew_strength=_inv.inv_skew_strength,
                 size_skew_strength=_inv.size_skew_strength,
@@ -99,6 +95,11 @@ class BotApp:
                 max_size_mult=_inv.max_size_mult,
                 near_limit_threshold=_inv.near_limit_threshold,
                 near_limit_side_mult=_inv.near_limit_side_mult,
+                vol_spread_k=_inv.vol_spread_k,
+                vol_ewma_span=_inv.vol_ewma_span,
+                max_half_spread_bps=_inv.max_half_spread_bps,
+                toxic_inv_threshold=_inv.toxic_inv_threshold,
+                toxic_ofi_threshold=_inv.toxic_ofi_threshold,
             ),
             ofi_cfg=OFIParams(
                 ofi_skew_strength=cfg.sim.ofi.ofi_skew_strength,
@@ -107,7 +108,6 @@ class BotApp:
                 trigger_threshold=cfg.sim.hedge.trigger_threshold,
                 hedge_fraction=cfg.sim.hedge.hedge_fraction,
                 cooldown_ticks=cfg.sim.hedge.cooldown_ticks,
-                price_move_trigger_pct=cfg.sim.hedge.price_move_trigger_pct,
                 taker_fee_pct=cfg.sim.hedge.taker_fee_pct,
             ),
             trade_stats=self.trade_stats,
@@ -123,9 +123,15 @@ class BotApp:
 
         # Tracks the last fill pushed to the telemetry store (dedup by trade_id)
         self._last_pushed_fill_id: int = 0
+        self._last_recorded_fill_id: int = 0
+        self._last_fill_tape_ts: dict = {}
+        self.recorder = None
 
         # Tracks the last tape-trade timestamp pushed per market (dedup by ts_ms)
         self._last_pushed_tape_ts: dict = {}
+
+        # Last mid per market, used to feed lagged realized-vol EWMA
+        self._last_mid: dict = {}
 
     @staticmethod
     def _mid_from_tob(tob):
@@ -166,11 +172,11 @@ class BotApp:
 
             # 2) Pick markets
             picked = select_markets(snaps, self.selector_cfg)
-            
-            # 2b) Apply pinned market filter (if enabled)
+
+            # 2b) Pin = one market. Unpinned = paper every subscribed book so
+            # recorder quotes/fills are not limited to the UI primary market.
             if self.pinned_market:
                 picked = [p for p in picked if p.market == self.pinned_market]
-                # If pinned market wasn't in selector output, try to add it manually
                 if not picked and self.pinned_market in self.ext_multi.feeds:
                     pinned_feed = self.ext_multi.feeds[self.pinned_market]
                     tob = pinned_feed.public_ws.tob
@@ -187,6 +193,11 @@ class BotApp:
                             tpm=tpm,
                             buy_ratio=0.5,
                         )]
+            else:
+                picked = [
+                    s for s in snaps
+                    if s.bid and s.ask and s.bid > 0 and s.ask > 0
+                ]
             
             # 3) Log selection
             if picked:
@@ -236,6 +247,24 @@ class BotApp:
 
                 q = self.paper.make_quote(mid, ofi_signal=_ofi_signal)
 
+                if self.recorder is not None:
+                    self.recorder.record_quote(
+                        ts=int(tob.ts_ms) if tob.ts_ms is not None else int(time.time() * 1000),
+                        market=p.market,
+                        bid_px=q.bid_px,
+                        ask_px=q.ask_px,
+                        bid_sz=q.bid_qty,
+                        ask_sz=q.ask_qty,
+                        mid=mid,
+                        norm_inv=self.paper.last_norm_inv,
+                    )
+
+                # Lagged realized vol: this tick's mid-move updates NEXT quote's spread
+                _prev_mid = self._last_mid.get(p.market)
+                if _prev_mid and _prev_mid > 0:
+                    self.paper.update_realized_vol(10000.0 * abs(mid - _prev_mid) / _prev_mid)
+                self._last_mid[p.market] = mid
+
                 # Capture quote for the first (primary) market for telemetry.
                 # Must be done here, before on_trade() may delete the order from
                 # the ladder when a fill fully consumes it.
@@ -250,16 +279,21 @@ class BotApp:
                 if hasattr(tape, "recent"):
                     # Use 2x tick window to account for timing and ensure we catch recent trades
                     recent_trades = list(tape.recent(tick * 2))
+                    _fill_watermarks = self._last_fill_tape_ts.get(p.market, 0)
+                    _fill_max_ts = _fill_watermarks
                     for tr in recent_trades:
                         # TradeTape.recent() returns tuples: (ts_ms, price, qty, side)
                         if isinstance(tr, tuple) and len(tr) == 4:
-                            _, trade_px, trade_qty, side = tr
+                            _ts_ms, trade_px, trade_qty, side = tr
                         else:
                             # fallback for alternate trade representations
+                            _ts_ms = getattr(tr, "ts_ms", 0)
                             trade_px = getattr(tr, "price", None)
                             trade_qty = getattr(tr, "qty", None)
                             side = getattr(tr, "side", None)
                         if trade_px is None or trade_qty is None or side is None:
+                            continue
+                        if _ts_ms <= _fill_watermarks:
                             continue
                         self.paper.on_trade(
                             mid=mid,
@@ -268,6 +302,10 @@ class BotApp:
                             side=str(side),
                             q=q,
                         )
+                        if _ts_ms > _fill_max_ts:
+                            _fill_max_ts = _ts_ms
+                    if _fill_max_ts > _fill_watermarks:
+                        self._last_fill_tape_ts[p.market] = _fill_max_ts
 
                     # Push new tape trades to telemetry for the microstructure chart.
                     # Dedup by timestamp so trades already pushed last tick are skipped.
@@ -297,6 +335,26 @@ class BotApp:
                     if not self._warned_no_recent:
                         log.warning("tape.recent(seconds) not implemented yet -> skipping paper fills.")
                         self._warned_no_recent = True
+
+            if self.recorder is not None and self.execution_tape is not None:
+                for _fill in self.execution_tape.get_history():
+                    if _fill.trade_id <= self._last_recorded_fill_id:
+                        continue
+                    self.recorder.record_fill({
+                        "ts": int(_fill.timestamp.timestamp() * 1000),
+                        "market": _fill.market,
+                        "trade_id": _fill.trade_id,
+                        "tick": _fill.tick,
+                        "side": _fill.side,
+                        "size": _fill.size,
+                        "price": _fill.price,
+                        "notional": _fill.notional,
+                        "edge": _fill.edge,
+                        "pos_after": _fill.pos_after,
+                        "is_hedge": _fill.is_hedge,
+                        "trigger_tape_price": _fill.trigger_tape_price,
+                    })
+                    self._last_recorded_fill_id = _fill.trade_id
 
             # 5) Calculate PnL correctly by marking all positions to their respective markets
             mid_prices = {}
@@ -512,7 +570,54 @@ class BotApp:
                             ))
                             self._last_pushed_fill_id = _f.trade_id
 
-            await asyncio.sleep(tick)
+            if self.recorder is not None:
+                every = max(1, int(getattr(self.cfg.recording, "metrics_every_ticks", 60)))
+                if self.state.ticks % every == 0:
+                    self._record_metrics_snapshot(pnl, mid_prices)
+
+            if self._shutdown is not None:
+                try:
+                    await asyncio.wait_for(self._shutdown.wait(), timeout=tick)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(tick)
+
+    def _record_metrics_snapshot(self, equity: float, mid_prices: dict) -> None:
+        if self.recorder is None:
+            return
+        markets = {}
+        names = set(self.paper.positions.keys())
+        if self.ext_multi is not None:
+            names.update(self.ext_multi.feeds.keys())
+        for market in sorted(names):
+            state = self.paper.positions.get(market, {})
+            pos = float(state.get("pos", 0.0) or 0.0)
+            avg_px = float(state.get("avg_price", 0.0) or 0.0)
+            rpnl = float(state.get("realized_pnl", 0.0) or 0.0)
+            mid_val = float(mid_prices.get(market, 0.0) or 0.0)
+            if mid_val == 0.0 and self.ext_multi and market in self.ext_multi.feeds:
+                m = self._mid_from_tob(self.ext_multi.feeds[market].public_ws.tob)
+                mid_val = float(m) if m is not None else 0.0
+            markets[market] = {
+                "pos": pos,
+                "avg_price": avg_px,
+                "rpnl": rpnl,
+                "inv_usd": pos * mid_val if mid_val else 0.0,
+                "mid": mid_val,
+            }
+        self.recorder.record_metrics({
+            "tick": self.state.ticks,
+            "equity": equity,
+            "cash": self.paper.state.cash_usd,
+            "edge": self.paper.total_edge_collected,
+            "fills": self.trade_stats.num_trades,
+            "volume": self.trade_stats.total_volume,
+            "notional": self.trade_stats.total_notional,
+            "hedges": self.paper.hedge_count,
+            "markets": markets,
+        })
 
     async def _initialize_markets(self) -> list[str]:
         """
@@ -554,7 +659,16 @@ class BotApp:
     
     async def run(self):
         log.info("Starting app...")
-        
+        log.info("Paper live-test only — no real orders will be placed.")
+        self._shutdown = asyncio.Event()
+
+        rec_cfg = self.cfg.recording
+        if rec_cfg.enabled:
+            rec_dir = Path(rec_cfg.dir)
+            rec_dir.mkdir(parents=True, exist_ok=True)
+            self.recorder = MarketRecorder(root=str(rec_dir), markets=list(rec_cfg.markets))
+            self.recorder.start()
+
         # Spawn fill monitor window (Trade History PowerShell – kept as-is)
         if self._spawn_fill_window:
             spawn_fill_monitor_window(self.fill_log_file)
@@ -562,28 +676,55 @@ class BotApp:
         if self.cfg.venues.extended.enabled:
             # Initialize markets (static or dynamic discovery)
             markets = await self._initialize_markets()
-            
+
+            if self.pinned_market:
+                markets = [self.pinned_market]
+                log.info(f"Pinned: subscribing only to {self.pinned_market}")
+            else:
+                log.info(f"Unpinned: subscribing to {len(markets)} static markets: {markets}")
+
+            if rec_cfg.enabled:
+                for m in rec_cfg.markets:
+                    if m not in markets:
+                        markets.append(m)
+
             if not markets:
                 log.error("No markets available to trade. Exiting.")
+                if self.recorder is not None:
+                    await self.recorder.stop()
                 return
-            
-            # Create multi-market feeds
-            log.info(f"🌐 Subscribing to {len(markets)} market feeds...")
+
+            book_depth = rec_cfg.book_depth if rec_cfg.enabled else None
+            log.info(
+                f"🌐 Subscribing to {len(markets)} market feeds "
+                f"(book depth={book_depth or self.cfg.extended_ws.depth})..."
+            )
             self.ext_multi = ExtendedMulti(
                 public_cfg=self.cfg.extended_ws,
                 trades_cfg=self.cfg.extended_ws,
                 markets=markets,
+                recorder=self.recorder,
+                book_depth=book_depth,
             )
             self.ext_multi.start()
 
         try:
-            await asyncio.gather(self.heartbeat_loop())
+            while self.state.running:
+                try:
+                    await self.heartbeat_loop()
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("paper loop crashed; restarting in 1s (WS/recorder still up)")
+                    await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             pass
         finally:
             if self.cfg.venues.extended.enabled and self.ext_multi:
                 await self.ext_multi.stop()
-            
+            if self.recorder is not None:
+                await self.recorder.stop()
             if self.rest_client:
                 await self.rest_client.close()
 
@@ -591,3 +732,5 @@ class BotApp:
 
     def stop(self):
         self.state.running = False
+        if self._shutdown is not None and not self._shutdown.is_set():
+            self._shutdown.set()

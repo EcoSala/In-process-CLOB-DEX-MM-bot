@@ -1,0 +1,32 @@
+# systemd unit for headless paper MM + Extended recorder (no real orders).
+#
+# 1. Copy:  sudo cp deploy/mm-bot.service /etc/systemd/system/mm-bot.service
+# 2. Edit User, Group, WorkingDirectory, ExecStart to match the VM.
+# 3. sudo systemctl daemon-reload && sudo systemctl enable --now mm-bot
+#
+# Logs:   journalctl -u mm-bot -f
+#         tail -f /home/REPLACE_USER/mm_bot/logs/mm.log
+# Data:   recording.dir in config.yaml (put this on the data disk)
+
+[Unit]
+Description=mm-bot paper MM + Extended L2/trades recorder
+Documentation=file:///home/REPLACE_USER/mm_bot/deploy/azure.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=REPLACE_USER
+Group=REPLACE_USER
+WorkingDirectory=/home/REPLACE_USER/mm_bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/REPLACE_USER/mm_bot/venv/bin/python run.py --config config.yaml
+Restart=always
+RestartSec=5
+TimeoutStopSec=25
+KillSignal=SIGTERM
+# Give the recorder time to flush gzip files on stop.
+FinalKillSignal=SIGKILL
+
+[Install]
+WantedBy=multi-user.target
